@@ -1,0 +1,118 @@
+=> Sniffer.py 
+from scapy.all import sniff, IP, TCP
+from db_handler import init_db, insert_packet
+from anomaly_detector import detect_anomaly
+from alert import send_alert
+
+init_db()
+
+def process_packet(packet):
+    if packet.haslayer(IP) and packet.haslayer(TCP):
+        ip_layer = packet[IP]
+        tcp_layer = packet[TCP]
+        src_ip = ip_layer.src
+        dst_ip = ip_layer.dst
+        src_port = tcp_layer.sport
+        dst_port = tcp_layer.dport
+        length = len(packet)
+        flags = tcp_layer.flags
+
+        insert_packet(src_ip, dst_ip, src_port, dst_port, length, str(flags))
+
+        if detect_anomaly(src_ip, dst_port):
+            send_alert(src_ip)
+            print(f"[!] ALERT: Possible port scan or flood from {src_ip}")
+
+print("[*] Starting packet sniffer...")
+sniff(filter="tcp", prn=process_packet, store=False)
+
+=> db_handler.py
+import sqlite3
+from datetime import datetime
+
+def init_db():
+    conn = sqlite3.connect('packets.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS packets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT,
+        src_ip TEXT,
+        dst_ip TEXT,
+        src_port INTEGER,
+        dst_port INTEGER,
+        length INTEGER,
+        flags TEXT
+    )''')
+    conn.commit()
+    conn.close()
+
+def insert_packet(src_ip, dst_ip, src_port, dst_port, length, flags):
+    conn = sqlite3.connect('packets.db')
+    c = conn.cursor()
+    c.execute("INSERT INTO packets (timestamp, src_ip, dst_ip, src_port, dst_port, length, flags) VALUES (?, ?, ?, ?, ?, ?, ?)", 
+              (datetime.now(), src_ip, dst_ip, src_port, dst_port, length, flags))
+    conn.commit()
+    conn.close()
+
+=> anomaly_detector.py
+from collections import defaultdict
+import time
+
+connection_tracker = defaultdict(list)
+THRESHOLD = 20  # connections per IP per 10 sec
+
+def detect_anomaly(src_ip, dst_port):
+    current_time = time.time()
+    connection_tracker[src_ip].append(current_time)
+    # Remove old entries
+    connection_tracker[src_ip] = [t for t in connection_tracker[src_ip] if current_time - t < 10]
+    
+    if len(connection_tracker[src_ip]) > THRESHOLD:
+        return True
+    return False
+
+=> alert.py
+def send_alert(src_ip):
+    with open("alerts.log", "a") as f:
+        f.write(f"[!] ALERT: Suspicious activity from {src_ip}\n")
+
+=> Plotter.py 
+import sqlite3
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from datetime import datetime
+
+# Set up figure
+fig, ax = plt.subplots()
+x_data, y_data = [], []
+line, = ax.plot_date(x_data, y_data, '-')
+
+def fetch_packet_counts():
+    conn = sqlite3.connect('packets.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT strftime('%H:%M:%S', timestamp), COUNT(*) FROM packets GROUP BY strftime('%H:%M:%S', timestamp) ORDER BY timestamp DESC LIMIT 20")
+    results = cursor.fetchall()
+    conn.close()
+    return results[::-1]  # oldest to newest
+
+def update(frame):
+    results = fetch_packet_counts()
+    if results:
+        times, counts = zip(*results)
+        x_data.clear()
+        y_data.clear()
+        x_data.extend([datetime.strptime(t, '%H:%M:%S') for t in times])
+        y_data.extend(counts)
+
+        line.set_data(x_data, y_data)
+        ax.relim()
+        ax.autoscale_view()
+
+    return line,
+
+ani = animation.FuncAnimation(fig, update, interval=1000)
+plt.title("Live Packet Count (per second)")
+plt.xlabel("Time")
+plt.ylabel("Packet Count")
+plt.tight_layout()
+plt.show()
